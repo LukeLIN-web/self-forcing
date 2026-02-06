@@ -560,7 +560,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         super().__init__()
 
-        assert model_type in ['t2v', 'i2v']
+        assert model_type in ['t2v', 'i2v', 'ti2v']
         self.model_type = model_type
 
         self.patch_size = patch_size
@@ -592,7 +592,7 @@ class WanModel(ModelMixin, ConfigMixin):
             nn.SiLU(), nn.Linear(dim, dim * 6))
 
         # blocks
-        cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+        cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'  # ti2v also uses i2v_cross_attn
         self.blocks = nn.ModuleList([
             WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps)
@@ -612,6 +612,7 @@ class WanModel(ModelMixin, ConfigMixin):
         ],
             dim=1)
 
+        # Only I2V needs img_emb (CLIP projection). TI2V uses VAE-encoded first frame instead.
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
 
@@ -671,6 +672,7 @@ class WanModel(ModelMixin, ConfigMixin):
         """
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
+        # ti2v: y is optional (None for T2V mode, not-None for I2V mode), clip_fea not needed
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -804,6 +806,7 @@ class WanModel(ModelMixin, ConfigMixin):
         """
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
+        # ti2v: y is optional (None for T2V mode, not-None for I2V mode), clip_fea not needed
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:

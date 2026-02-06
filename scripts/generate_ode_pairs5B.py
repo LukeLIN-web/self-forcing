@@ -25,8 +25,8 @@ import math
 import os
 
 
-# 5B model path
-MODEL_PATH = # input from shell
+# 5B model path (set via --model_path argument)
+MODEL_PATH = None
 
 # 5B model latent config (704x1280 resolution)
 # VAE stride: (4, 16, 16) -> latent: frames/4, height/16, width/16
@@ -88,10 +88,15 @@ class WanTextEncoder5B(torch.nn.Module):
 class WanDiffusionWrapper5B(torch.nn.Module):
     """Diffusion wrapper for 5B model."""
 
-    def __init__(self, model_path=MODEL_PATH, timestep_shift=5.0):
+    def __init__(self, model_path=MODEL_PATH, timestep_shift=5.0, device=None):
         super().__init__()
 
-        self.model = WanModel.from_pretrained(model_path)
+        # Load sharded model - use "auto" device_map, then move to specific device
+        self.model = WanModel.from_pretrained(
+            model_path,
+            device_map="auto",
+            torch_dtype=torch.float32
+        )
         self.model.eval()
 
         self.uniform_timestep = True
@@ -158,11 +163,12 @@ class WanDiffusionWrapper5B(torch.nn.Module):
         return flow_pred, pred_x0
 
 
-def init_model(device):
-    print(f"Loading 5B model from {MODEL_PATH}...")
+def init_model(device, model_path):
+    print(f"Loading 5B model from {model_path}...")
 
-    model = WanDiffusionWrapper5B().to(device).to(torch.float32)
-    encoder = WanTextEncoder5B().to(device).to(torch.float32)
+    # Pass device to wrapper for device_map loading
+    model = WanDiffusionWrapper5B(model_path=model_path, device=device)
+    encoder = WanTextEncoder5B(model_path=model_path).to(device).to(torch.float32)
     model.model.requires_grad_(False)
 
     scheduler = FlowMatchScheduler(
@@ -185,32 +191,41 @@ def main():
     parser.add_argument("--caption_path", type=str, required=True)
     parser.add_argument("--guidance_scale", type=float, default=5.0)  # 5B uses 5.0
     parser.add_argument("--num_frames", type=int, default=NUM_FRAMES)
+    parser.add_argument("--model_path", type=str, required=True, help="Path to Wan2.2-TI2V-5B model")
 
     args = parser.parse_args()
 
-    launch_distributed_job()
+    # Support both single GPU and distributed modes
+    is_distributed = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+    if is_distributed:
+        launch_distributed_job()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
 
-    device = torch.cuda.current_device()
+    device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
 
     torch.set_grad_enabled(False)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    model, encoder, scheduler, unconditional_dict = init_model(device=device)
+    model, encoder, scheduler, unconditional_dict = init_model(device=device, model_path=args.model_path)
 
     dataset = TextDataset(args.caption_path)
 
     os.makedirs(args.output_folder, exist_ok=True)
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print(f"Total prompts: {len(dataset)}")
         print(f"Output folder: {args.output_folder}")
 
     for index in tqdm(
-        range(int(math.ceil(len(dataset) / dist.get_world_size()))),
-        disable=dist.get_rank() != 0
+        range(int(math.ceil(len(dataset) / world_size))),
+        disable=rank != 0
     ):
-        prompt_index = index * dist.get_world_size() + dist.get_rank()
+        prompt_index = index * world_size + rank
         if prompt_index >= len(dataset):
             continue
 
@@ -268,9 +283,10 @@ def main():
             os.path.join(args.output_folder, f"{prompt_index:05d}.pt")
         )
 
-    dist.barrier()
+    if is_distributed:
+        dist.barrier()
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print("Done!")
 
 

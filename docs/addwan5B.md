@@ -957,3 +957,298 @@ print(f"has img_emb: {hasattr(model, 'img_emb')}")  # 应输出: False
 block = model.blocks[0]
 print(f"cross_attn type: {type(block.cross_attn).__name__}")  # 应输出: WanT2VCrossAttention
 ```
+
+---
+
+## 11. 5B 模型分片加载问题（重点）
+
+### 11.1 问题现象
+
+5B 模型约 20GB，被分成 3 个 safetensors 文件：
+```
+diffusion_pytorch_model-00001-of-00003.safetensors
+diffusion_pytorch_model-00002-of-00003.safetensors
+diffusion_pytorch_model-00003-of-00003.safetensors
+diffusion_pytorch_model.safetensors.index.json
+```
+
+使用 `WanModel.from_pretrained()` 加载时遇到各种错误。
+
+### 11.2 尝试的方案及失败原因
+
+#### 方案 1：直接 `from_pretrained` + `.to(device)`
+
+```python
+model = WanModel.from_pretrained(model_path)
+model.to(device)
+```
+
+**错误**: `NotImplementedError: Cannot copy out of meta tensor; no data!`
+
+**原因**: diffusers 使用 accelerate 的 meta tensor 机制。模型先在 meta device（虚拟设备，无实际数据）上初始化，然后 `load_checkpoint_and_dispatch` 按需加载权重。但在调用 `.to(device)` 时，meta tensor 没有数据无法迁移。
+
+#### 方案 2：使用 `device_map` 参数
+
+```python
+model = WanModel.from_pretrained(model_path, device_map=device)
+```
+
+**错误**: `ValueError: weight is on the meta device, we need a value to put in on {device}`
+
+**原因**: 在分布式环境下（torchrun 启动 4 个进程），每个进程有不同的 device ID (0,1,2,3)。accelerate 的 device_map 机制不支持这种多进程同时加载的场景。每个进程都尝试初始化 meta tensor 然后 dispatch 到自己的 GPU，但 dispatch 逻辑没有正确处理。
+
+#### 方案 3：禁用 `low_cpu_mem_usage`
+
+```python
+model = WanModel.from_pretrained(model_path, low_cpu_mem_usage=False)
+```
+
+**错误**: `TypeError: expected str, bytes or os.PathLike object, not NoneType`
+
+**原因**: 当 `low_cpu_mem_usage=False` 时，diffusers 尝试找单个 checkpoint 文件加载。但 5B 是分片存储的，它找不到 `diffusion_pytorch_model.safetensors`（不存在），返回 None，导致后续文件打开失败。
+
+### 11.3 根本原因
+
+1. **模型太大**: 5B 约 20GB，单 GPU 显存不够装完整模型 + 梯度
+2. **分片存储格式**: safetensors 分片格式需要特殊处理
+3. **diffusers 版本限制**: Self-Forcing 使用的 diffusers 版本对分片模型支持不完善
+4. **分布式环境冲突**: torchrun 多进程与 accelerate 的自动设备映射机制冲突
+
+### 11.4 可行的解决方案
+
+#### 方案 A：手动加载分片模型（推荐）
+
+绕过 diffusers 的 `from_pretrained`，直接用 safetensors 库加载：
+
+```python
+from safetensors.torch import load_file
+import json
+import os
+
+def load_sharded_safetensors(model_path):
+    """手动加载分片 safetensors 模型"""
+    index_path = os.path.join(model_path, "diffusion_pytorch_model.safetensors.index.json")
+
+    with open(index_path, 'r') as f:
+        index = json.load(f)
+
+    # 获取所有分片文件
+    shard_files = sorted(set(index["weight_map"].values()))
+
+    # 逐个加载合并
+    state_dict = {}
+    for shard_file in shard_files:
+        shard_path = os.path.join(model_path, shard_file)
+        print(f"Loading {shard_file}...")
+        shard_dict = load_file(shard_path)
+        state_dict.update(shard_dict)
+
+    return state_dict
+
+# 使用方式
+from wan.modules.model import WanModel
+import json
+
+# 1. 读取 config
+with open(os.path.join(model_path, "config.json")) as f:
+    config = json.load(f)
+
+# 2. 创建空模型
+model = WanModel(**config)
+
+# 3. 加载权重
+state_dict = load_sharded_safetensors(model_path)
+model.load_state_dict(state_dict)
+
+# 4. 移动到 GPU
+model.to(device)
+```
+
+#### 方案 B：单 GPU 模式
+
+放弃多 GPU 并行，改用单 GPU：
+
+```bash
+# gen_ode_5B.sh
+export CUDA_VISIBLE_DEVICES=0
+python scripts/generate_ode_pairs5B.py \
+    --output_folder ode_pairs_5B/ \
+    --caption_path prompts/vidprom_filtered_extended.txt \
+    --model_path /path/to/Wan2.2-TI2V-5B
+```
+
+然后在代码中用单进程加载：
+```python
+model = WanModel.from_pretrained(model_path, device_map="cuda:0")
+```
+
+缺点：生成速度慢，需要更多时间。
+
+#### 方案 C：参考原版 Wan2.2 加载方式
+
+原版 `wan/textimage2video.py` 的流程：
+1. `init_on_cpu=True` — 在 CPU 上初始化
+2. `from_pretrained` 加载
+3. 推理时再 `.to(device)`
+
+关键：原版不在多进程环境下每个进程都加载完整模型，而是使用 FSDP 分片或单进程。
+
+#### 方案 D：升级 diffusers 版本
+
+新版 diffusers (>=0.28) 对分片模型支持更好。尝试：
+```bash
+pip install diffusers>=0.28
+```
+
+但可能引入其他兼容性问题。
+
+### 11.5 推荐实现
+
+在 `scripts/generate_ode_pairs5B.py` 中使用方案 A：
+
+```python
+class WanDiffusionWrapper5B(torch.nn.Module):
+    def __init__(self, model_path, timestep_shift=5.0):
+        super().__init__()
+
+        # 手动加载分片模型
+        self.model = self._load_sharded_model(model_path)
+        self.model.eval()
+        # ... 其他初始化代码 ...
+
+    def _load_sharded_model(self, model_path):
+        from safetensors.torch import load_file
+        import json
+
+        # 读取 config
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path) as f:
+            config = json.load(f)
+
+        # 创建模型
+        model = WanModel(**config)
+
+        # 加载分片权重
+        index_path = os.path.join(model_path, "diffusion_pytorch_model.safetensors.index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+
+        state_dict = {}
+        for shard_file in sorted(set(index["weight_map"].values())):
+            shard_path = os.path.join(model_path, shard_file)
+            state_dict.update(load_file(shard_path))
+
+        model.load_state_dict(state_dict)
+        return model
+```
+
+### 11.6 架构差异总结
+
+| 特性 | Wan2.1 1.3B | Wan2.2 TI2V-5B |
+|------|-------------|----------------|
+| 模型大小 | ~2.6GB | ~20GB |
+| 存储格式 | 单个 .pth 或 .safetensors | 分片 safetensors (3 个文件) |
+| model_type | t2v | ti2v |
+| latent channels | 16 | 48 |
+| VAE stride | (4, 8, 8) | (4, 16, 16) |
+| 分辨率 | 480×832 | 704×1280 |
+| 加载复杂度 | 简单 | 需要手动处理分片 |
+
+### 11.7 img_emb 参数不匹配问题
+
+#### 问题现象
+
+使用 `device_map="auto"` 加载时报错：
+```
+ValueError: weight is on the meta device, we need a `value` to put in on 0.
+```
+
+#### 原因分析
+
+1. **model.py 的修改引入了问题**：
+   我们之前修改了 `wan/modules/model.py` 第 615-616 行：
+   ```python
+   # 修改前
+   if model_type == 'i2v':
+       self.img_emb = MLPProj(1280, dim)
+
+   # 修改后（错误）
+   if model_type in ['i2v', 'ti2v']:
+       self.img_emb = MLPProj(1280, dim)
+   ```
+
+2. **TI2V 不需要 img_emb**：
+   - I2V-14B 使用 CLIP 特征作为图片条件，需要 `img_emb` 投影层
+   - TI2V-5B 使用 VAE 编码的首帧作为条件（通过 `y` 参数），**不需要** `img_emb`
+
+3. **checkpoint 中没有 img_emb 权重**：
+   - 当模型初始化时，`img_emb` 在 meta device 上创建
+   - accelerate 尝试从 checkpoint 加载权重，但找不到 `img_emb.*` 的权重
+   - 导致 `img_emb` 的参数仍在 meta device 上，无法 dispatch 到真实设备
+
+4. **accelerate 的 meta tensor 机制**：
+   ```
+   模型初始化 (meta device) → 加载 checkpoint → dispatch 到真实设备
+                                    ↓
+                           img_emb 没有对应权重
+                                    ↓
+                           img_emb 仍在 meta device
+                                    ↓
+                           dispatch 失败
+   ```
+
+#### 解决方案
+
+**方案 1：修复 model.py 的 img_emb 条件判断（推荐）**
+
+```python
+# wan/modules/model.py line 615-616
+# TI2V 不需要 img_emb，只有 I2V 需要
+if model_type == 'i2v':  # 不要包含 'ti2v'
+    self.img_emb = MLPProj(1280, dim)
+```
+
+**方案 2：手动加载避免 meta tensor**
+
+使用 safetensors 手动加载，完全绕过 accelerate 的 meta tensor 机制：
+
+```python
+from safetensors.torch import load_file
+import json
+
+def load_5b_model(model_path, device):
+    # 1. 读取 config
+    with open(os.path.join(model_path, "config.json")) as f:
+        config = json.load(f)
+
+    # 2. 在真实设备上创建模型（不用 meta tensor）
+    model = WanModel(**config)
+
+    # 3. 加载分片权重
+    index_path = os.path.join(model_path, "diffusion_pytorch_model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+
+    state_dict = {}
+    for shard_file in sorted(set(index["weight_map"].values())):
+        shard_dict = load_file(os.path.join(model_path, shard_file))
+        state_dict.update(shard_dict)
+
+    # 4. 加载权重（strict=False 允许多余参数）
+    model.load_state_dict(state_dict, strict=False)
+
+    # 5. 移动到目标设备
+    model.to(device)
+    return model
+```
+
+#### TI2V vs I2V 的关键区别
+
+| 特性 | I2V-14B | TI2V-5B |
+|------|---------|---------|
+| 图片条件方式 | CLIP 特征 (`clip_fea`) | VAE 编码首帧 (`y`) |
+| 需要 img_emb | **是** | **否** |
+| 交叉注意力 | `WanI2VCrossAttention` | `WanT2VCrossAttention` |
+| checkpoint 包含 img_emb | **是** | **否** |
+
+TI2V 本质上是 T2V + 首帧 inpainting 条件，模型结构与 T2V 相同。

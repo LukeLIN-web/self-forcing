@@ -9,6 +9,7 @@ Self-Forcing is a training framework for autoregressive video diffusion models t
 ### Note
 
 Don't write absolute path in markdown!!!
+input absolute path from shell script, don't write in python. 
 
 ## Common Commands
 
